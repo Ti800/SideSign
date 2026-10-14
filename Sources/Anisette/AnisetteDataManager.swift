@@ -252,9 +252,50 @@ public final class AnisetteDataManager: @unchecked Sendable {
         let timestamp: Date
     }
     private var remoteCache: RemoteAnisetteCacheEntry?
-    
+
+    // Last successful remote fetch, needed to resync with the same server/identity on GSA hsc 434
+    private struct RemoteAnisetteContext {
+        let serverURL: URL
+        let identifier: UUID
+        let adiBlob: Data?
+        let data: AnisetteData
+    }
+    private var lastRemoteContext: RemoteAnisetteContext?
+
     public func clearCache() {
         remoteCache = nil
+    }
+
+    /// Resyncs the anisette identity used by the last remote fetch with the SIM sent by GSA
+    /// (`Status.hsc == 434`) and returns fresh anisette data for that identity.
+    public func resyncRemoteAnisetteData(for anisetteData: AnisetteData, sim: String) async throws -> AnisetteData {
+        guard let context = lastRemoteContext,
+              context.data.machineID == anisetteData.machineID,
+              context.data.deviceID == anisetteData.deviceID else {
+            throw AnisetteError.providerNotReady("Anisette resync is only supported for data fetched from a remote anisette server")
+        }
+        guard let adiBlob = context.adiBlob, !adiBlob.isEmpty else {
+            throw AnisetteError.providerNotReady("Anisette resync requires a provisioned adi.pb")
+        }
+
+        debugLog("[AnisetteDataManager] Resyncing anisette with \(context.serverURL.absoluteString)...")
+        let provider = RemoteAnisetteDataProvider(serverURL: context.serverURL)
+        let response = try await provider.resyncAnisetteHeaders(
+            identifier: withUnsafeBytes(of: context.identifier.uuid) { Array($0) },
+            adiPb: [UInt8](adiBlob),
+            sim: sim,
+            deviceID: context.data.deviceID,
+            localUserID: context.data.localUserID
+        )
+
+        var data = context.data
+        data.machineID = response.machineID
+        data.oneTimePassword = response.oneTimePassword
+        data.clientTime = ISO8601DateFormatter().string(from: Date())
+
+        remoteCache = nil
+        lastRemoteContext = RemoteAnisetteContext(serverURL: context.serverURL, identifier: context.identifier, adiBlob: adiBlob, data: data)
+        return data
     }
 
     public static var defaultBaseDirectory: URL {
@@ -433,7 +474,10 @@ public final class AnisetteDataManager: @unchecked Sendable {
             }
         }
 
-        let clientInfo = headers?.clientInfo ?? Constants.Anisette.defaultClientInfo
+        // A stray newline in a user-supplied client info makes GSA reply with an empty body
+        let trimmedClientInfo = headers?.clientInfo?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientInfo = (trimmedClientInfo?.isEmpty == false ? trimmedClientInfo : nil) ?? Constants.Anisette.defaultClientInfo
+        let headers = headers?.with { $0.clientInfo = clientInfo }
         let client = try await getClient(for: resolvedMode, clientInfo: clientInfo)
 
         do {
@@ -453,6 +497,14 @@ public final class AnisetteDataManager: @unchecked Sendable {
                     newAdiBlob: newBlob,
                     timestamp: Date()
                 )
+                lastRemoteContext = RemoteAnisetteContext(
+                    serverURL: serverURL,
+                    identifier: identifier,
+                    adiBlob: newBlob ?? existingAdiBlob,
+                    data: anisetteData
+                )
+            } else {
+                lastRemoteContext = nil
             }
 
             return (anisetteData, newBlob)

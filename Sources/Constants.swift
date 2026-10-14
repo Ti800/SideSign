@@ -126,8 +126,21 @@ public enum Constants {
     }
 
     public enum Anisette {
-        public static let defaultClientInfo     = AnisetteConstants.defaultClientInfo
+        // GSA started rejecting macOS client info for third-party anisette with -80045,
+        // Android client info is still accepted (same fix as nab138/isideload 0.4.5)
+        public static let defaultClientInfo     = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         public static let defaultUserAgent      = AnisetteConstants.defaultUserAgent
+
+        // Previous defaults that were persisted into user configs; migrated to defaultClientInfo on load
+        public static let legacyClientInfos: Set<String> = [
+            AnisetteConstants.defaultClientInfo,
+            "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/26.0)>",
+            "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>",
+        ]
+
+        // GSA response status code asking the client to resync anisette before retrying
+        public static let resyncStatusCode      = 434
+        public static let resyncDataKey         = "X-Apple-I-MD-DATA"
 
         public enum URLs {
             public static let grandSlamLookup   = AnisetteConstants.URLs.grandSlamLookup

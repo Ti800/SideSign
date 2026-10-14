@@ -57,32 +57,15 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
         adiPb: [UInt8]
     ) async throws -> AnisetteDataResponse {
         let cleanIdentifier = identifier.map { String(format: "%02x", $0) }.joined()
-        let baseURL = serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 
         // 1. If adiPb is present, attempt v3 /v3/get_headers
         if !adiPb.isEmpty {
-            if let v3HeadersURL = URL(string: "\(baseURL)/\(Constants.URLs.v3GetHeaders)") {
-                var postReq = URLRequest(url: v3HeadersURL)
-                postReq.timeoutInterval = Constants.Anisette.remoteRequestTimeout
-                postReq.httpMethod = "POST"
-                postReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                postReq.cachePolicy = .reloadIgnoringLocalCacheData
-
-                let payload: [String: String] = [
-                    "identifier": cleanIdentifier,
-                    "adi_pb": Data(adiPb).base64EncodedString()
-                ]
-                postReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
-
-                if let (data, response) = try? await URLSession.shared.data(for: postReq),
-                   let httpResp = response as? HTTPURLResponse, httpResp.isSuccess,
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                    if let result = json["result"], result == "GetHeadersError" {
-                        let msg = json["message"] ?? "GetHeadersError"
-                        throw AnisetteError.badServerResponse(statusCode: -1, payload: msg)
-                    }
-                    return try AnisetteDataResponse(from: json)
-                }
+            let payload: [String: String] = [
+                "identifier": cleanIdentifier,
+                "adi_pb": Data(adiPb).base64EncodedString()
+            ]
+            if let result = try await postV3GetHeaders(payload: payload) {
+                return result
             }
         }
 
@@ -102,6 +85,58 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
             throw AnisetteError.invalidAnisetteData
         }
 
+        return try AnisetteDataResponse(from: json)
+    }
+
+    /// Asks a v3 server to resync the ADI state with the SIM returned by GSA (`Status.hsc == 434`)
+    /// and returns the corrected headers. Servers without resync support ignore the extra fields.
+    public func resyncAnisetteHeaders(
+        identifier: [UInt8],
+        adiPb: [UInt8],
+        sim: String,
+        deviceID: String,
+        localUserID: String
+    ) async throws -> AnisetteDataResponse {
+        guard !adiPb.isEmpty else {
+            throw AnisetteError.providerNotReady("Cannot resync anisette without an adi.pb")
+        }
+
+        let payload: [String: String] = [
+            "identifier": identifier.map { String(format: "%02x", $0) }.joined(),
+            "adi_pb": Data(adiPb).base64EncodedString(),
+            "sim": sim,
+            "device_id": deviceID,
+            "md_lu": localUserID
+        ]
+        guard let result = try await postV3GetHeaders(payload: payload) else {
+            throw AnisetteError.badServerResponse(statusCode: -1, payload: "Anisette resync request to \(serverURL.absoluteString) failed")
+        }
+        return result
+    }
+
+    /// Returns nil when the server is unreachable or does not speak v3, so callers can fall back.
+    private func postV3GetHeaders(payload: [String: String]) async throws -> AnisetteDataResponse? {
+        let baseURL = serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let v3HeadersURL = URL(string: "\(baseURL)/\(Constants.URLs.v3GetHeaders)") else {
+            return nil
+        }
+
+        var postReq = URLRequest(url: v3HeadersURL)
+        postReq.timeoutInterval = Constants.Anisette.remoteRequestTimeout
+        postReq.httpMethod = "POST"
+        postReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        postReq.cachePolicy = .reloadIgnoringLocalCacheData
+        postReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        guard let (data, response) = try? await URLSession.shared.data(for: postReq),
+              let httpResp = response as? HTTPURLResponse, httpResp.isSuccess,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return nil
+        }
+        if let result = json["result"], result == "GetHeadersError" {
+            let msg = json["message"] ?? "GetHeadersError"
+            throw AnisetteError.badServerResponse(statusCode: -1, payload: msg)
+        }
         return try AnisetteDataResponse(from: json)
     }
 
