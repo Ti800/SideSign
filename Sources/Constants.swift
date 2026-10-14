@@ -131,9 +131,11 @@ public enum Constants {
         public static let defaultClientInfo     = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         public static let defaultUserAgent      = AnisetteConstants.defaultUserAgent
 
-        // Previous defaults that were persisted into user configs; migrated to defaultClientInfo on load
+        // Previous defaults that were persisted into user configs; migrated to defaultClientInfo on load.
+        // The MacBookPro13,2 one is what anisette-v3-server reports from /v3/client_info.
         public static let legacyClientInfos: Set<String> = [
             AnisetteConstants.defaultClientInfo,
+            "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
             "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/26.0)>",
             "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>",
         ]

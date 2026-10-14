@@ -64,7 +64,7 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
                 "identifier": cleanIdentifier,
                 "adi_pb": Data(adiPb).base64EncodedString()
             ]
-            if let result = try await postV3GetHeaders(payload: payload) {
+            if case .headers(let result) = try await postV3GetHeaders(payload: payload) {
                 return result
             }
         }
@@ -98,9 +98,10 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
         localUserID: String
     ) async throws -> AnisetteDataResponse {
         guard !adiPb.isEmpty else {
-            throw AnisetteError.providerNotReady("Cannot resync anisette without an adi.pb")
+            throw AnisetteError.resyncFailed("no adi.pb to resync")
         }
 
+        // identifier must stay hex like provisioning/get_headers, the server maps it to the same ADI identity
         let payload: [String: String] = [
             "identifier": identifier.map { String(format: "%02x", $0) }.joined(),
             "adi_pb": Data(adiPb).base64EncodedString(),
@@ -108,17 +109,24 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
             "device_id": deviceID,
             "md_lu": localUserID
         ]
-        guard let result = try await postV3GetHeaders(payload: payload) else {
-            throw AnisetteError.badServerResponse(statusCode: -1, payload: "Anisette resync request to \(serverURL.absoluteString) failed")
+        switch try await postV3GetHeaders(payload: payload) {
+        case .headers(let result):
+            return result
+        case .unavailable(let reason):
+            throw AnisetteError.resyncFailed("\(serverURL.absoluteString): \(reason)")
         }
-        return result
     }
 
-    /// Returns nil when the server is unreachable or does not speak v3, so callers can fall back.
-    private func postV3GetHeaders(payload: [String: String]) async throws -> AnisetteDataResponse? {
+    private enum V3HeadersResult {
+        case headers(AnisetteDataResponse)
+        case unavailable(reason: String)
+    }
+
+    /// `.unavailable` when the server is unreachable or does not speak v3, so callers can fall back.
+    private func postV3GetHeaders(payload: [String: String]) async throws -> V3HeadersResult {
         let baseURL = serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let v3HeadersURL = URL(string: "\(baseURL)/\(Constants.URLs.v3GetHeaders)") else {
-            return nil
+            return .unavailable(reason: "invalid server URL")
         }
 
         var postReq = URLRequest(url: v3HeadersURL)
@@ -128,16 +136,25 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
         postReq.cachePolicy = .reloadIgnoringLocalCacheData
         postReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        guard let (data, response) = try? await URLSession.shared.data(for: postReq),
-              let httpResp = response as? HTTPURLResponse, httpResp.isSuccess,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            return nil
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: postReq)
+        } catch {
+            return .unavailable(reason: error.localizedDescription)
+        }
+        guard let httpResp = response as? HTTPURLResponse, httpResp.isSuccess else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            return .unavailable(reason: "HTTP \(status): \(String(data: data, encoding: .utf8) ?? "")")
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return .unavailable(reason: "unexpected response: \(String(data: data, encoding: .utf8) ?? "\(data.count) bytes")")
         }
         if let result = json["result"], result == "GetHeadersError" {
             let msg = json["message"] ?? "GetHeadersError"
             throw AnisetteError.badServerResponse(statusCode: -1, payload: msg)
         }
-        return try AnisetteDataResponse(from: json)
+        return .headers(try AnisetteDataResponse(from: json))
     }
 
     public func startProvision(

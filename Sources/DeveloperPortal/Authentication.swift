@@ -19,6 +19,12 @@ private enum AnisetteResyncState {
 
 private struct AnisetteResyncRequired: Error {
     let sim: String
+    let errorCode: Int
+    let message: String?
+
+    var gsaDescription: String {
+        "hsc \(Constants.Anisette.resyncStatusCode), ec \(errorCode)" + (message.map { ": \($0)" } ?? "")
+    }
 }
 
 /// GSA answers `Status.hsc == 434` with a base64 SIM in `X-Apple-I-MD-DATA` when the anisette state must be resynced.
@@ -87,19 +93,23 @@ public extension DeveloperPortal {
         debugLog("[SideSign] Sending authentication 'init' request...")
         let initResponse: [String: any Sendable]
         do {
-            initResponse = try await sendAuthenticationRequest(
+            initResponse = try await performAuthenticationRequest(
                 parameters: initParameters,
                 anisetteData: anisetteData,
-                allowAnisetteResync: !AnisetteResyncState.attempted
+                detectAnisetteResync: true
             )
         } catch let resync as AnisetteResyncRequired {
-            debugLog("[SideSign] GSA requested an anisette resync (hsc 434). Resyncing and retrying init...")
+            guard !AnisetteResyncState.attempted else {
+                debugLog("[SideSign] GSA still requests an anisette resync after resyncing (\(resync.gsaDescription))")
+                throw DeveloperPortalError.invalidAnisetteData(cause: "Apple still requires an anisette resync after resyncing (\(resync.gsaDescription)). The anisette server may not support resync, try another server.")
+            }
+            debugLog("[SideSign] GSA requested an anisette resync (\(resync.gsaDescription)). Resyncing and retrying init...")
             let resyncedAnisetteData: AnisetteData
             do {
-                resyncedAnisetteData = try await AnisetteDataManager.shared.resyncRemoteAnisetteData(for: anisetteData, sim: resync.sim)
+                resyncedAnisetteData = try await AnisetteDataManager.resyncRemoteAnisetteData(for: anisetteData, sim: resync.sim)
             } catch {
                 debugLog("[SideSign] Anisette resync failed: \(error)")
-                throw DeveloperPortalError.invalidAnisetteData(cause: "Apple requested an anisette resync, but it failed: \(error.localizedDescription)")
+                throw DeveloperPortalError.invalidAnisetteData(cause: "Apple requested an anisette resync (\(resync.gsaDescription)), but it failed: \(error.localizedDescription)")
             }
             return try await AnisetteResyncState.$attempted.withValue(true) {
                 try await authenticate(
@@ -267,16 +277,19 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
-                    try await authenticate(
-                        appleID: unsanitizedAppleID,
-                        password: password,
-                        anisetteData: anisetteData,
-                        xcodeVersion: xcodeVersion,
-                        machinePassword: machinePassword,
-                        accountRepairHandler: accountRepairHandler,
-                        verificationHandler: verificationHandler
-                    )
+                // The post-2FA login is a fresh init, so it may resync again
+                return try await AnisetteResyncState.$attempted.withValue(false) {
+                    try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
+                        try await authenticate(
+                            appleID: unsanitizedAppleID,
+                            password: password,
+                            anisetteData: anisetteData,
+                            xcodeVersion: xcodeVersion,
+                            machinePassword: machinePassword,
+                            accountRepairHandler: accountRepairHandler,
+                            verificationHandler: verificationHandler
+                        )
+                    }
                 }
 
             case "repair":
@@ -350,9 +363,13 @@ public extension DeveloperPortal {
         return AuthSession(account: account, session: session)
     }
 
-    func sendAuthenticationRequest(parameters requestParameters: [String: any Sendable],
-                                   anisetteData: AnisetteData,
-                                   allowAnisetteResync: Bool = false) async throws -> [String: any Sendable] {
+    func sendAuthenticationRequest(parameters requestParameters: [String: any Sendable], anisetteData: AnisetteData) async throws -> [String: any Sendable] {
+        try await performAuthenticationRequest(parameters: requestParameters, anisetteData: anisetteData, detectAnisetteResync: false)
+    }
+
+    private func performAuthenticationRequest(parameters requestParameters: [String: any Sendable],
+                                              anisetteData: AnisetteData,
+                                              detectAnisetteResync: Bool) async throws -> [String: any Sendable] {
         let requestURL = Constants.URLs.grandSlamAuth
         let h = customHeaders
 
@@ -409,8 +426,8 @@ public extension DeveloperPortal {
             throw ServerError.missingKey(key: "Status", jsonPayload: rawStr)
         }
 
-        if allowAnisetteResync, let sim = anisetteResyncSIM(from: status) {
-            throw AnisetteResyncRequired(sim: sim)
+        if detectAnisetteResync, let sim = anisetteResyncSIM(from: status) {
+            throw AnisetteResyncRequired(sim: sim, errorCode: status["ec"] as? Int ?? 0, message: status["em"] as? String)
         }
 
         let errorCode = status["ec"] as? Int ?? 0

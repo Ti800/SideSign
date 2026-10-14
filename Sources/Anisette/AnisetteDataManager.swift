@@ -187,6 +187,7 @@ public enum AnisetteError: LocalizedError, Sendable {
     case invalidURL
     case outdatedV1Server(server: URL, reason: String? = nil)
     case serverListFetchFailed(String)
+    case resyncFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -228,6 +229,8 @@ public enum AnisetteError: LocalizedError, Sendable {
             }
         case .serverListFetchFailed(let reason):
             return "Failed to fetch server list: \(reason)"
+        case .resyncFailed(let reason):
+            return "Anisette resync failed: \(reason)"
         }
     }
 }
@@ -261,21 +264,47 @@ public final class AnisetteDataManager: @unchecked Sendable {
         let data: AnisetteData
     }
     private var lastRemoteContext: RemoteAnisetteContext?
+    // Guards remoteCache and lastRemoteContext, fetches can run concurrently
+    private let stateLock = NSLock()
+
+    // Manager that made the most recent remote fetch, so auth can resync without knowing which instance the caller used.
+    // Held strongly: callers like the CLI drop their manager before authenticating.
+    private final class ManagerRef: @unchecked Sendable {
+        private let lock = NSLock()
+        private var manager: AnisetteDataManager?
+        var value: AnisetteDataManager? {
+            get { lock.withLock { manager } }
+            set { lock.withLock { manager = newValue } }
+        }
+    }
+    private static let lastRemoteManager = ManagerRef()
 
     public func clearCache() {
-        remoteCache = nil
+        stateLock.withLock {
+            remoteCache = nil
+            lastRemoteContext = nil
+        }
     }
 
-    /// Resyncs the anisette identity used by the last remote fetch with the SIM sent by GSA
+    /// Resyncs the anisette identity that produced `anisetteData` with the SIM sent by GSA
     /// (`Status.hsc == 434`) and returns fresh anisette data for that identity.
-    public func resyncRemoteAnisetteData(for anisetteData: AnisetteData, sim: String) async throws -> AnisetteData {
-        guard let context = lastRemoteContext,
+    /// Only data from a remote anisette server can be resynced (needs proper testing against servers with resync support).
+    public static func resyncRemoteAnisetteData(for anisetteData: AnisetteData, sim: String) async throws -> AnisetteData {
+        guard let manager = lastRemoteManager.value else {
+            throw AnisetteError.resyncFailed("only anisette data from a remote server can be resynced")
+        }
+        return try await manager.resyncRemoteAnisetteData(for: anisetteData, sim: sim)
+    }
+
+    private func resyncRemoteAnisetteData(for anisetteData: AnisetteData, sim: String) async throws -> AnisetteData {
+        let context = stateLock.withLock { lastRemoteContext }
+        guard let context,
               context.data.machineID == anisetteData.machineID,
               context.data.deviceID == anisetteData.deviceID else {
-            throw AnisetteError.providerNotReady("Anisette resync is only supported for data fetched from a remote anisette server")
+            throw AnisetteError.resyncFailed("only anisette data from a remote server can be resynced")
         }
         guard let adiBlob = context.adiBlob, !adiBlob.isEmpty else {
-            throw AnisetteError.providerNotReady("Anisette resync requires a provisioned adi.pb")
+            throw AnisetteError.resyncFailed("no provisioned adi.pb for this identity")
         }
 
         debugLog("[AnisetteDataManager] Resyncing anisette with \(context.serverURL.absoluteString)...")
@@ -293,8 +322,10 @@ public final class AnisetteDataManager: @unchecked Sendable {
         data.oneTimePassword = response.oneTimePassword
         data.clientTime = ISO8601DateFormatter().string(from: Date())
 
-        remoteCache = nil
-        lastRemoteContext = RemoteAnisetteContext(serverURL: context.serverURL, identifier: context.identifier, adiBlob: adiBlob, data: data)
+        stateLock.withLock {
+            remoteCache = RemoteAnisetteCacheEntry(serverURL: context.serverURL, identifier: context.identifier, data: data, newAdiBlob: nil, timestamp: Date())
+            lastRemoteContext = RemoteAnisetteContext(serverURL: context.serverURL, identifier: context.identifier, adiBlob: adiBlob, data: data)
+        }
         return data
     }
 
@@ -464,7 +495,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
         }
 
         if case .remote(let serverURL) = resolvedMode {
-            if let cache = remoteCache,
+            if let cache = stateLock.withLock({ remoteCache }),
                cache.serverURL == serverURL,
                cache.identifier == identifier,
                Date().timeIntervalSince(cache.timestamp) < Constants.Anisette.remoteCacheDuration 
@@ -490,27 +521,32 @@ public final class AnisetteDataManager: @unchecked Sendable {
             let anisetteData = try Self.validateAndCreateAnisetteData(from: rawHeaders)
 
             if case .remote(let serverURL) = resolvedMode {
-                remoteCache = RemoteAnisetteCacheEntry(
-                    serverURL: serverURL,
-                    identifier: identifier,
-                    data: anisetteData,
-                    newAdiBlob: newBlob,
-                    timestamp: Date()
-                )
-                lastRemoteContext = RemoteAnisetteContext(
-                    serverURL: serverURL,
-                    identifier: identifier,
-                    adiBlob: newBlob ?? existingAdiBlob,
-                    data: anisetteData
-                )
+                stateLock.withLock {
+                    remoteCache = RemoteAnisetteCacheEntry(
+                        serverURL: serverURL,
+                        identifier: identifier,
+                        data: anisetteData,
+                        newAdiBlob: newBlob,
+                        timestamp: Date()
+                    )
+                    lastRemoteContext = RemoteAnisetteContext(
+                        serverURL: serverURL,
+                        identifier: identifier,
+                        adiBlob: newBlob ?? existingAdiBlob,
+                        data: anisetteData
+                    )
+                }
+                Self.lastRemoteManager.value = self
             } else {
-                lastRemoteContext = nil
+                stateLock.withLock { lastRemoteContext = nil }
             }
 
             return (anisetteData, newBlob)
         } catch {
-            if case .remote(let serverURL) = resolvedMode, remoteCache?.serverURL == serverURL {
-                remoteCache = nil
+            if case .remote(let serverURL) = resolvedMode {
+                stateLock.withLock {
+                    if remoteCache?.serverURL == serverURL { remoteCache = nil }
+                }
             }
             if let errorHandler = onError {
                 let shouldContinue = try await errorHandler(error)
