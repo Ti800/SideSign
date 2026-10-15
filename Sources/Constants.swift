@@ -126,9 +126,10 @@ public enum Constants {
     }
 
     public enum Anisette {
-        // GSA started rejecting macOS client info for third-party anisette with -80045,
-        // Android client info is still accepted (same fix as nab138/isideload 0.4.5)
-        public static let defaultClientInfo     = "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        // GSA rejects macOS client info with -80045 (2026-10-13) and Android client info with HTTP 503
+        // (2026-10-15). The Windows iTunes identity is accepted with the existing anisette servers too,
+        // it's what nab138/isideload 0.4.6 gets from ani.jkcoxson.com. Needs re-checking when Apple changes again.
+        public static let defaultClientInfo     = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
         public static let defaultUserAgent      = AnisetteConstants.defaultUserAgent
 
         // Previous defaults that were persisted into user configs; migrated to defaultClientInfo on load.
@@ -138,6 +139,10 @@ public enum Constants {
             "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
             "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/26.0)>",
             "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>",
+            "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>",
+            // Android identities: the previous default and the workaround posted in SideStore#1647 / SideSign#5
+            "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+            "<Pixel 8><Android; 14; UQ1A.240205.004><com.apple.AuthKit/1 (com.apple.android.music/4.9.6)>",
         ]
 
         // GSA response status code asking the client to resync anisette before retrying

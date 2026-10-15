@@ -415,7 +415,14 @@ public extension DeveloperPortal {
 
         guard let responseDictionary = parsePlistOrJSON(data) else {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
-            debugLog("[SideSign] Auth endpoint returned invalid response format: \(rawStr)")
+            debugLog("[SideSign] Auth endpoint returned invalid response format (HTTP \(statusCode)): \(rawStr)")
+            // GSA answers a rejected client identity with an HTML error page (e.g. 503), surface the status instead
+            if !(200..<300).contains(statusCode) {
+                throw ServerError.badServerResponse(
+                    reason: "Auth endpoint returned HTTP \(statusCode). Apple may be rejecting the anisette client info (\(anisetteData.clientInfo)).",
+                    jsonPayload: rawStr
+                )
+            }
             throw ServerError.invalidResponseFormat(rawPayload: rawStr)
         }
 
